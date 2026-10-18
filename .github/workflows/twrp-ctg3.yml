@@ -21,6 +21,18 @@ on:
         description: '编译并行度（留空 = nproc）'
         required: false
         default: ''
+      stock_boot_url:
+        description: '（可选）当前固件 boot.img 直链：给了就用它里的 kernel/dtb 覆盖 prebuilt'
+        required: false
+        default: ''
+      stock_dtbo_url:
+        description: '（可选）当前固件 dtbo.img 直链：给了就覆盖 prebuilt/dtbo.img'
+        required: false
+        default: ''
+      variant:
+        description: '产物类型：recovery（独立 recovery 分区）或 boot（塞进 boot 分区）'
+        required: false
+        default: 'recovery'
 
 concurrency:
   group: twrp-ctg3-${{ github.ref }}
@@ -31,11 +43,12 @@ env:
   MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch || 'twrp-12.1' }}
   DEVICE_BRANCH: ${{ github.event.inputs.device_branch || 'master' }}
   LUNCH_TARGET: ctg3-eng
+  VARIANT: ${{ github.event.inputs.variant || 'recovery' }}
   TZ: UTC
 
 jobs:
   build:
-    name: TWRP 12.1 / ctg3
+    name: TWRP 12.1 / ctg3 / ${{ github.event.inputs.variant || 'recovery' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 355
     steps:
@@ -44,6 +57,7 @@ jobs:
           echo "repo      : ${{ github.repository }} @ ${{ github.ref_name }}"
           echo "manifest  : $MANIFEST_URL -b $MANIFEST_BRANCH"
           echo "devicetree: $DEVICE_BRANCH"
+          echo "variant   : $VARIANT"
           nproc; free -h; df -h /
 
       - name: 释放磁盘空间
@@ -124,17 +138,51 @@ jobs:
           ls -la "$DEST"
           ls -la "$DEST/prebuilt" || echo "!! 警告：prebuilt 目录缺失，本次构建大概率失败"
 
-      - name: 编译 recovery.img
+      - name: 用当前固件刷新 prebuilt（kernel / dtb / dtbo）
+        if: ${{ github.event.inputs.stock_boot_url != '' }}
+        run: |
+          SRC="$GITHUB_WORKSPACE/android"
+          DEST="$SRC/device/iflytek/ctg3"
+          cd "$GITHUB_WORKSPACE"
+          curl -fsSL "${{ github.event.inputs.stock_boot_url }}" -o stock-boot.img
+          ls -l stock-boot.img
+          DTBO_ARG=""
+          if [ -n "${{ github.event.inputs.stock_dtbo_url }}" ]; then
+            curl -fsSL "${{ github.event.inputs.stock_dtbo_url }}" -o stock-dtbo.img
+            ls -l stock-dtbo.img
+            DTBO_ARG="--dtbo $GITHUB_WORKSPACE/stock-dtbo.img"
+          fi
+          echo "===== 分析（不写入）====="
+          python3 "$GITHUB_WORKSPACE/tools/reprebuilt.py" stock-boot.img --device-dir "$DEST" $DTBO_ARG || true
+          python3 "$GITHUB_WORKSPACE/tools/reprebuilt.py" stock-boot.img --device-dir "$DEST" $DTBO_ARG --apply \
+            | tee "$GITHUB_WORKSPACE/reprebuilt.log"
+          {
+            echo "### prebuilt 刷新结果"
+            echo '```'
+            cat "$GITHUB_WORKSPACE/reprebuilt.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 编译（recovery 或 boot）
         run: |
           SRC="$GITHUB_WORKSPACE/android"
           LOG="$GITHUB_WORKSPACE/build.log"
           LUNCHLOG="$GITHUB_WORKSPACE/lunch.log"
+          DEST="$SRC/device/iflytek/ctg3"
           cd "$SRC"
           set -o pipefail
           source build/envsetup.sh
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
-          export TARGET_RECOVERY_DEVICE_DIR="$SRC/device/iflytek/ctg3"
+          export TARGET_RECOVERY_DEVICE_DIR="$DEST"
+
+          if [ "$VARIANT" = "boot" ]; then
+            echo "==> variant=boot：把 recovery ramdisk 打进 boot 分区（绕过 recovery 引导路径）"
+            printf '\n# --- CI 追加：TWRP as boot ---\nBOARD_USES_RECOVERY_AS_BOOT := true\n' >> "$DEST/BoardConfig.mk"
+            TARGET_IMG=bootimage
+          else
+            TARGET_IMG=recoveryimage
+          fi
 
           # 注意：lunch 必须直接调用，不能放进管道/命令替换，否则 export 会丢
           set +e
@@ -155,9 +203,9 @@ jobs:
 
           JOBS="${{ github.event.inputs.jobs }}"
           [ -z "$JOBS" ] && JOBS=$(nproc)
-          echo "并行度: $JOBS"
+          echo "并行度: $JOBS  目标: $TARGET_IMG"
           set +e
-          make -j"$JOBS" recoveryimage 2>&1 | tee "$LOG"
+          make -j"$JOBS" "$TARGET_IMG" 2>&1 | tee "$LOG"
           rc=${PIPESTATUS[0]}
           set -e
           if [ $rc -ne 0 ]; then
@@ -176,19 +224,19 @@ jobs:
         run: |
           OUT="$GITHUB_WORKSPACE/android/out/target/product/ctg3"
           ls -la "$OUT"/*.img 2>/dev/null || true
-          cd "$OUT" && sha256sum recovery.img 2>/dev/null || true
+          cd "$OUT" && sha256sum *.img 2>/dev/null | tee "$GITHUB_WORKSPACE/sha256.txt" || true
           df -h /
 
-      - name: 上传 recovery.img
+      - name: 上传产物
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: TWRP-ctg3-recovery-img
+          name: TWRP-ctg3-${{ github.event.inputs.variant || 'recovery' }}
           path: |
             android/out/target/product/ctg3/recovery.img
-            android/out/target/product/ctg3/recovery.tar*
             android/out/target/product/ctg3/boot.img
             android/out/target/product/ctg3/dtbo.img
+            sha256.txt
           if-no-files-found: warn
           retention-days: 30
 
@@ -200,5 +248,6 @@ jobs:
           path: |
             build.log
             android/sync.log
+            reprebuild.log
           if-no-files-found: ignore
           retention-days: 14
