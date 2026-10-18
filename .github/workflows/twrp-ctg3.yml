@@ -1,0 +1,175 @@
+name: Build TWRP (iflytek ctg3 / T20Pro)
+
+# 只在 master 上构建，main 保持不动
+on:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: 'TWRP minimal manifest 分支'
+        required: false
+        default: 'twrp-12.1'
+      device_branch:
+        description: '设备树分支'
+        required: false
+        default: 'master'
+      jobs:
+        description: '编译并行度（留空 = nproc）'
+        required: false
+        default: ''
+
+concurrency:
+  group: twrp-ctg3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+  MANIFEST_BRANCH: ${{ github.event.inputs.manifest_branch || 'twrp-12.1' }}
+  DEVICE_BRANCH: ${{ github.event.inputs.device_branch || 'master' }}
+  LUNCH_TARGET: ctg3-eng
+  TZ: UTC
+
+jobs:
+  build:
+    name: TWRP 12.1 / ctg3
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    steps:
+      - name: 环境信息
+        run: |
+          echo "repo      : ${{ github.repository }} @ ${{ github.ref_name }}"
+          echo "manifest  : $MANIFEST_URL -b $MANIFEST_BRANCH"
+          echo "devicetree: $DEVICE_BRANCH"
+          nproc; free -h; df -h /
+
+      - name: 释放磁盘空间
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/lib/R/site-library 2>/dev/null || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib git \
+            gnupg gperf imagemagick libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev unzip python3 python-is-python3 || \
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git gperf libelf-dev libssl-dev \
+            libxml2 libxml2-utils lzop rsync squashfs-tools xsltproc zip zlib1g-dev \
+            unzip python3
+          sudo apt-get install -y --no-install-recommends openjdk-11-jdk-headless || true
+
+      - name: 安装 repo
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: 配置 git
+        run: |
+          git config --global user.name  "TWRP Builder"
+          git config --global user.email "builder@localhost"
+          git config --global color.ui false
+
+      - name: repo init
+        run: |
+          SRC="$GITHUB_WORKSPACE/android"
+          mkdir -p "$SRC" && cd "$SRC"
+          repo init --depth=1 --no-repo-verify \
+            -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
+          du -sh .repo
+
+      - name: repo sync（约 20-30GB，10-25 分钟）
+        run: |
+          SRC="$GITHUB_WORKSPACE/android"
+          cd "$SRC"
+          for i in 1 2 3; do
+            echo "=== sync attempt $i ==="
+            if repo sync -c --force-sync --no-clone-bundle --no-tags \
+                 -j"$(nproc)" --optimized-fetch 2>&1 | tee "sync.log" | tail -n 5; then
+              break
+            fi
+            echo "sync 失败，20s 后重试"; sleep 20
+          done
+          git -C .repo/manifests rev-parse HEAD || true
+          # 清掉 .repo 项目对象，省出 5-10GB 给 out/
+          rm -rf .repo/projects/*/.git .repo/project-objects/* 2>/dev/null || true
+          df -h /
+          du -sh "$SRC"
+
+      - name: 放入设备树
+        run: |
+          SRC="$GITHUB_WORKSPACE/android"
+          DEST="$SRC/device/iflytek/ctg3"
+          mkdir -p "$(dirname "$DEST")"
+          git clone --depth 1 -b "$DEVICE_BRANCH" \
+            "https://github.com/${{ github.repository }}.git" "$DEST"
+          rm -rf "$DEST/.git"
+          echo "--- 设备树内容 ---"
+          ls -la "$DEST"
+          ls -la "$DEST/prebuilt" || echo "!! 警告：prebuilt 目录缺失，本次构建大概率失败"
+
+      - name: 编译 recovery.img
+        run: |
+          SRC="$GITHUB_WORKSPACE/android"
+          cd "$SRC"
+          set -o pipefail
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          export TARGET_RECOVERY_DEVICE_DIR="$SRC/device/iflytek/ctg3"
+
+          if ! lunch "$LUNCH_TARGET" 2>&1 | tail -n 15; then
+            echo "lunch $LUNCH_TARGET 失败，尝试 twrp_ctg3-eng"
+            lunch twrp_ctg3-eng
+          fi
+
+          JOBS="${{ github.event.inputs.jobs }}"
+          [ -z "$JOBS" ] && JOBS=$(nproc)
+          echo "并行度: $JOBS"
+          make -j"$JOBS" recoveryimage 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 300
+
+      - name: 结果信息
+        if: success()
+        run: |
+          OUT="$GITHUB_WORKSPACE/android/out/target/product/ctg3"
+          ls -la "$OUT"/*.img 2>/dev/null || true
+          cd "$OUT" && sha256sum recovery.img 2>/dev/null || true
+          df -h /
+
+      - name: 上传 recovery.img
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TWRP-ctg3-recovery-img
+          path: |
+            android/out/target/product/ctg3/recovery.img
+            android/out/target/product/ctg3/recovery.tar*
+            android/out/target/product/ctg3/boot.img
+            android/out/target/product/ctg3/dtbo.img
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build.log
+            android/sync.log
+          if-no-files-found: ignore
+          retention-days: 14
