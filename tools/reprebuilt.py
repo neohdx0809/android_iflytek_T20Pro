@@ -77,13 +77,59 @@ def parse_boot(data):
     raise SystemExit(f"不支持的 header_version={hver}")
 
 
+
+def probe(path):
+    """识别手里这个文件到底是什么格式，避免拿错（RK 的 kernel.img / resource.img 不是 boot.img）"""
+    d = open(path, "rb").read()
+    print(f"文件: {path}  ({len(d)} B)")
+    kind = None
+    if d[:8] == b"ANDROID!":
+        kind = "Android boot image（正确来源，可用 --apply 抽取）"
+    elif len(d) > 64 and d[56:60] == b"ARM\x64":
+        kind = "raw ARM64 Image（内核本体，可直接改名 prebuilt/kernel）"
+    elif len(d) > 40 and d[0x24:0x28] in (b"\x18\x28\x6f\x01",):
+        kind = "ARM32 zImage（32 位内核，不是这台机器的）"
+    elif d[:4] in (b"RSCE",):
+        kind = "Rockchip resource.img（里面才是 dtb，需要用 --from-resource 拆）"
+    elif d[:4] == b"\xd0\x0d\xfe\xed":
+        kind = "DTB / FIT 镜像（设备树，可作 prebuilt/dtb.img）"
+    elif d[:4] == b"\x27\x05\x19\x56":
+        kind = "uImage（旧式 U-Boot 镜像）"
+    else:
+        kind = "未知格式"
+    print(f"判定: {kind}")
+    i = d.find(b"Linux version ")
+    if i >= 0:
+        print("内核版本串:", d[i:i+110].split(b"\n")[0].split(b"#")[0].decode(errors="replace"))
+    if d[:4] == b"RSCE":
+        # Rockchip resource.img：连续 [size(4)][type(4)][name(256)] 的条目
+        off = 4
+        print("resource.img 条目:")
+        while off + 264 + 4 <= len(d):
+            size, typ = struct.unpack_from("<II", d, off)
+            name = d[off+8:off+8+256].split(b"\x00")[0].decode(errors="replace")
+            print(f"  {name:32s} type={typ} size={size}")
+            off += 264
+            off += (size + 511) // 512 * 512
+            if off > len(d):
+                break
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("boot_img")
+    ap.add_argument("boot_img", nargs="?")
+    ap.add_argument("--probe", metavar="FILE", help="只识别文件格式，不做抽取")
     ap.add_argument("--dtbo", help="当前固件的 dtbo 分区镜像（可选，用来重建 recovery_dtbo）")
     ap.add_argument("--device-dir", default="device/iflytek/ctg3")
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args()
+
+    if a.probe:
+        probe(a.probe)
+        return
+    if not a.boot_img:
+        ap.error("需要 boot.img 路径，或用 --probe 识别文件")
 
     data = open(a.boot_img, "rb").read()
     info = parse_boot(data)
