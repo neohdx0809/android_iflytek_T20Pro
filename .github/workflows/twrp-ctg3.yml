@@ -94,6 +94,7 @@ jobs:
 
       - name: repo sync（约 20-30GB，10-25 分钟）
         run: |
+          set -o pipefail
           SRC="$GITHUB_WORKSPACE/android"
           cd "$SRC"
           for i in 1 2 3; do
@@ -105,10 +106,11 @@ jobs:
             echo "sync 失败，20s 后重试"; sleep 20
           done
           git -C .repo/manifests rev-parse HEAD || true
-          # 清掉 .repo 项目对象，省出 5-10GB 给 out/
-          rm -rf .repo/projects/*/.git .repo/project-objects/* 2>/dev/null || true
           df -h /
           du -sh "$SRC"
+          AVAIL=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "剩余磁盘: ${AVAIL}G"
+          if [ "$AVAIL" -lt 35 ]; then echo "::error::磁盘不足 35G，继续会中途失败"; exit 1; fi
 
       - name: 放入设备树
         run: |
@@ -125,6 +127,8 @@ jobs:
       - name: 编译 recovery.img
         run: |
           SRC="$GITHUB_WORKSPACE/android"
+          LOG="$GITHUB_WORKSPACE/build.log"
+          LUNCHLOG="$GITHUB_WORKSPACE/lunch.log"
           cd "$SRC"
           set -o pipefail
           source build/envsetup.sh
@@ -132,15 +136,40 @@ jobs:
           export LC_ALL=C
           export TARGET_RECOVERY_DEVICE_DIR="$SRC/device/iflytek/ctg3"
 
-          if ! lunch "$LUNCH_TARGET" 2>&1 | tail -n 15; then
-            echo "lunch $LUNCH_TARGET 失败，尝试 twrp_ctg3-eng"
+          # 注意：lunch 必须直接调用，不能放进管道/命令替换，否则 export 会丢
+          set +e
+          lunch "$LUNCH_TARGET" > "$LUNCHLOG" 2>&1
+          rc=$?
+          set -e
+          tail -n 25 "$LUNCHLOG"
+          if [ $rc -ne 0 ]; then
+            echo "lunch $LUNCH_TARGET 失败(rc=$rc)，尝试 twrp_ctg3-eng"
             lunch twrp_ctg3-eng
+          fi
+
+          echo "TARGET_PRODUCT=$TARGET_PRODUCT  TARGET_DEVICE=$(get_build_var TARGET_DEVICE)  TARGET_ARCH=$(get_build_var TARGET_ARCH)"
+          if [ "$TARGET_PRODUCT" != "ctg3" ]; then
+            echo "::error::lunch 没有选中 ctg3（当前 '$TARGET_PRODUCT'），终止，避免白跑几小时"
+            exit 1
           fi
 
           JOBS="${{ github.event.inputs.jobs }}"
           [ -z "$JOBS" ] && JOBS=$(nproc)
           echo "并行度: $JOBS"
-          make -j"$JOBS" recoveryimage 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 300
+          set +e
+          make -j"$JOBS" recoveryimage 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::error::make 失败 (rc=$rc)"
+            {
+              echo "### 关键错误行"
+              echo '```'
+              grep -nE "error:|Error [0-9]+|FAILED:|ninja: build stopped|No rule to make|Killed|out of memory" "$LOG" | head -n 60
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit $rc
+          fi
 
       - name: 结果信息
         if: success()
